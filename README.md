@@ -1,125 +1,89 @@
 # SIS Text Analyzer
 
-An individual Go project for SIS. Checkpoint 2: concurrent processing.
+An individual Go project for SIS. Checkpoint 2: Concurrent Processing.
 
 ## Requirements
-
 - Go 1.27
 - Standard library only
 
 ## Description
 
-The application creates text analysis tasks, stores them in memory and
-processes them with a worker pool. Each task has:
-- a unique integer ID within a service instance;
-- the original input text;
-- a status;
-- a result containing word and rune counts.
+The application analyzes text using a worker pool.
 
-## Processing rules (from Checkpoint 1)
+Each task contains:
+- Unique ID
+- Original input text
+- Current status
+- Result (word count and rune count)
 
-- Empty and whitespace-only input is rejected.
-- Words are separated using `strings.Fields`; punctuation stays part of a word.
-- Runes are counted using `utf8.RuneCountInString` (spaces, punctuation,
-  tabs and newlines are counted too).
-- The original input is preserved.
+**Processing rules:**
+- Empty input is rejected.
+- Words are separated using `strings.Fields`.
+- Runes are counted using `utf8.RuneCountInString`.
+- Original text is preserved.
 
-Example: `"Hello Go world"` -> Words: 3, Runes: 14.
+Example: `"Hello Go world"` → 3 words, 14 runes.
 
-## Concurrency architecture
+## Concurrency
 
-```text
-  Create(text) ──> TaskService (map[int]*Task, RWMutex)
-                         ^              ^
-  Submit(id) ──> queue: chan int        |  startProcessing / runAndComplete
-                 (capacity 5)           |
-                    |                   |
-          +---------+---------+         |
-          v         v         v         |
-      Worker 1  Worker 2  Worker 3 -----+
-```
+The application uses a worker pool with:
+- 3 workers
+- Buffered channel with capacity of 5
+- Goroutines for concurrent processing
 
-1. `service.Create(text)` validates the text and stores a `Pending` task.
-2. `pool.Submit(id)` moves the task to `Queued`, puts its ID into the queue
-   channel and returns immediately. It does not wait for processing.
-3. A fixed number of workers (`workerCount = 3` in `main.go`) read IDs from
-   the queue with `for id := range queue`. A worker marks the task
-   `Processing`, runs the processor, saves the result and marks it
-   `Completed`. Then it takes the next task.
-4. The order in which tasks finish is not guaranteed.
+**How it works:**
 
-### Queue
+1. `Create(text)` validates and stores a new task.
+2. `Submit(id)` adds the task ID to the queue and returns immediately.
+3. Workers take tasks from the queue and process them.
+4. After processing, the result is saved and the status becomes `Completed`.
 
-- The queue is a buffered channel with a fixed capacity
-  (`queueCapacity = 5` in `main.go`).
-- **Full queue:** `Submit` does not block. It returns `ErrQueueFull` and the
-  task goes back to `Pending`, so it can be submitted later.
-- No extra goroutines are created per task; only the workers exist.
+Tasks may finish in a different order.
 
-### Task lifecycle
+If the queue is full, `Submit` returns `ErrQueueFull`, and the task remains `Pending`.
+
+## Task Statuses
 
 ```text
-Pending ──Submit──> Queued ──worker──> Processing ──> Completed
-   ^                  |
-   +---queue full-----+
-
-Pending ──Process (synchronous, Checkpoint 1)──> Processing ──> Completed
+Pending → Queued → Processing → Completed
 ```
 
-Allowed transitions:
-- `Pending -> Queued` (Submit);
-- `Queued -> Pending` (queue was full, submission rejected);
-- `Queued -> Processing` (a worker took the task);
-- `Pending -> Processing` (synchronous `Process`, kept from Checkpoint 1);
-- `Processing -> Completed` (result saved).
+- `Pending` – task created.
+- `Queued` – waiting for a worker.
+- `Processing` – currently being processed.
+- `Completed` – processing finished.
 
-Everything else returns `ErrInvalidState`: submitting a `Queued`,
-`Processing` or `Completed` task, or calling `Process` on a queued task.
-Rejected operations do not change the task. Retries are not supported.
-The text processor cannot fail, so there is no `Failed` state.
+The original synchronous `Process()` method from Checkpoint 1 is also supported.
 
-### Synchronization
+Invalid status transitions return `ErrInvalidState`.
 
-- `TaskService.mu` (`sync.RWMutex`) protects the task map, the ID counter and
-  **all fields of every stored task**. Task pointers never leave the service;
-  `Get` and `Create` return copies.
-- `Get` uses a read lock, so many readers can work at the same time.
-- Every status change is "check current status + set new status" inside one
-  lock (`changeStatus`). Two goroutines can't both move the same task out of
-  `Pending`/`Queued`, so a task is never processed twice.
-- The lock is **not** held while the processor runs. The worker copies the
-  input under the lock, processes it without the lock, and then saves the
-  result under the lock. Other tasks can be created and read meanwhile.
-- Workers process different task IDs, so a worker only writes the result
-  into its own task.
-- `WorkerPool.mu` (`sync.Mutex`) protects the `stopped` flag. `Submit` checks
-  the flag and sends to the channel under this lock, and `Stop` sets the flag
-  and closes the channel under the same lock. So `Submit` can never send to a
-  closed channel. The send is non-blocking, so the lock is held only briefly.
-- Lock order is always `WorkerPool.mu -> TaskService.mu`, never the reverse,
-  so there is no deadlock.
+## Synchronization
 
-### Stopping workers
+- `sync.RWMutex` protects tasks and their data.
+- `sync.Mutex` protects the worker pool's stopped state.
+- Workers safely process tasks concurrently.
+- Locks are not held while text is being processed.
+- `sync.WaitGroup` waits for all workers to finish.
+
+## Stopping the Pool
 
 `pool.Stop()`:
-1. sets `stopped = true` - new `Submit` calls return `ErrPoolStopped`;
-2. closes the queue (the pool owns the channel and is the only closer);
-3. workers finish the tasks still in the queue (`range` reads remaining
-   values after close) and then exit;
-4. waits for all workers with `sync.WaitGroup`.
+1. Stops accepting new tasks.
+2. Closes the queue.
+3. Allows workers to finish queued tasks.
+4. Waits for all workers to exit.
 
-After `Stop` returns, every accepted task is `Completed`. Calling `Stop`
-again returns `ErrPoolStopped` and does nothing.
+After stopping, new submissions return `ErrPoolStopped`.
 
-## Files
+## Project Structure
 
-- `main.go` - demonstration
-- `task.go` - domain types and statuses
-- `processor.go` - processing interface and text analyzer
-- `service.go` - task storage and thread-safe state changes
-- `pool.go` - worker pool, bounded queue, shutdown
-- `service_test.go` - Checkpoint 1 tests
-- `pool_test.go` - concurrency tests
+- `main.go` – application example.
+- `task.go` – task types and statuses.
+- `processor.go` – text processing.
+- `service.go` – task management.
+- `pool.go` – worker pool and queue.
+- `service_test.go` – service tests.
+- `pool_test.go` – concurrency tests.
 
 ## Run
 
@@ -127,7 +91,7 @@ again returns `ErrPoolStopped` and does nothing.
 go run .
 ```
 
-## Check
+## Tests and Checks
 
 ```bash
 gofmt -l .
@@ -138,21 +102,15 @@ go test -race ./...
 
 ## Tests
 
-Checkpoint 1 tests (creation, validation, results, states, repeated
-processing) still pass. New tests in `pool_test.go` cover:
-- pool startup and invalid configuration;
-- asynchronous submission (`Submit` returns while the task is processing);
-- `Queued` state while all workers are busy;
-- processing of many tasks with correct results;
-- real overlap: 3 tasks are inside the processor at the same time, and never
-  more than the number of workers;
-- invalid and duplicate submissions (missing, Queued, Processing, Completed);
-- full queue: `ErrQueueFull`, task stays `Pending`, can be resubmitted;
-- reading tasks while others are processing;
-- many goroutines creating, submitting and reading tasks at once;
-- `Stop` waits for accepted tasks and workers terminate;
-- `Submit` after `Stop`, and a second `Stop`;
-- `Submit` racing with several `Stop` calls: no panic, no lost tasks.
+Tests cover:
+- Task creation and validation.
+- Correct word and rune counts.
+- Worker pool startup and shutdown.
+- Concurrent task processing.
+- Queue capacity and full queue handling.
+- Invalid and duplicate submissions.
+- Thread-safe task creation and reading.
+- Race conditions between `Submit` and `Stop`.
+- Correct task statuses and results.
 
-Tests use a blocking test processor and channels to control timing, so they
-do not depend on `time.Sleep` or on the order in which tasks finish.
+All tests use controlled channels to check concurrency without relying on `time.Sleep`.
