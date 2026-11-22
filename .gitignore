@@ -1,0 +1,7 @@
+# Checkpoint 1 project (kept locally for reference)
+sis-text-analyzer/
+
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
